@@ -1,0 +1,48 @@
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1403,6 +1403,8 @@
+ 			blk_mq_handle_zone_resource(rq, &zone_list);
+ 			needs_resource = true;
+ 			break;
++		/* [prj4] Send a skipped request to the default case and end it here */
++		case BLK_STS_BYPASS:
+ 		default:
+ 			errors++;
+ 			blk_mq_end_request(rq, ret);
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -931,6 +931,11 @@
+ 	struct nvme_queue *nvmeq = hctx->driver_data;
+ 	struct nvme_dev *dev = nvmeq->dev;
+ 	struct request *req = bd->rq;
++
++	/* [prj4] If a Write Zeroes request for Cosmos+ still gets here, do not send it; return right away */
++	if((dev->ctrl.quirks & NVME_QUIRK_DISABLE_WRITE_ZEROES) && req_op(req)==REQ_OP_WRITE_ZEROES)
++		return BLK_STS_BYPASS;
++
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 	blk_status_t ret;
+ 
+@@ -3489,6 +3494,10 @@
+ 				NVME_QUIRK_SHARED_TAGS |
+ 				NVME_QUIRK_SKIP_CID_GEN },
+ 	{ PCI_DEVICE_CLASS(PCI_CLASS_STORAGE_EXPRESS, 0xffffff) },
++	/* [prj4] Apply the existing kernel quirk DISABLE_WRITE_ZEROES to Cosmos+ OpenSSD (Xilinx 10ee:7028).
++	 * With it, the Write Zeroes limit becomes 0, so the block layer writes zero-filled data instead */
++	{ PCI_DEVICE(0x10ee, 0x7028),
++		.driver_data = NVME_QUIRK_DISABLE_WRITE_ZEROES, },
+ 	{ 0, }
+ };
+ MODULE_DEVICE_TABLE(pci, nvme_id_table);
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -134,6 +134,9 @@
+  */
+ #define BLK_STS_ZONE_ACTIVE_RESOURCE	((__force blk_status_t)16)
+ 
++/* [prj4] New status: the Write Zeroes request was skipped, not sent to the device */
++#define BLK_STS_BYPASS	((__force blk_status_t)17)
++
+ /**
+  * blk_path_error - returns true if error may be path related
+  * @error: status the request was completed with

@@ -1,0 +1,250 @@
+--- a/firmware/kv_store.h
++++ b/firmware/kv_store.h
+@@ -0,0 +1,28 @@
++// [prj3] KV-SSD index definition (new file)
++#ifndef KV_STORE_H_
++#define KV_STORE_H_
++
++#include <stdint.h>
++#include "memory_map.h"
++
++// [prj3] Direct-mapped index: one array entry for every key (4,194,304 keys).
++//        Keys are 4-byte integers from 0 to 4M-1, so the key itself is the array index -> O(1) lookup.
++#define MAX_KV_ENTRIES 4194304
++
++// [prj3] The index lives in reserved DRAM after the FTL area (RESERVED1 to the end of DRAM).
++//        12 B x 4M entries = about 48 MB, which fits easily.
++#define KV_INDEX_ADDR  RESERVED1_START_ADDR
++
++// [prj3] Where one key's value is. The value itself is on NAND; the index keeps only its LSA.
++typedef struct {
++	uint32_t lsa;          // LSA where the value is written
++	uint32_t value_len;    // value length in bytes
++	uint8_t valid;         // set once the key has been PUT
++} KV_INDEX_ENTRY;
++
++extern KV_INDEX_ENTRY* kv_index;
++extern uint32_t kv_current_lsa;
++
++void InitKvStore();
++
++#endif
+--- a/firmware/kv_store.c
++++ b/firmware/kv_store.c
+@@ -0,0 +1,17 @@
++// [prj3] KV-SSD index setup (new file)
++#include "kv_store.h"
++#include <string.h>
++#include "xil_printf.h"
++
++KV_INDEX_ENTRY* kv_index = (KV_INDEX_ENTRY*)KV_INDEX_ADDR;
++
++// [prj3] Next write position of the append-only value log.
++//        Each PUT writes its value here, then moves it forward by the blocks written.
++//        A new PUT of the same key goes to a new place and only updates the index, so the old value is dropped.
++uint32_t kv_current_lsa = 0;
++
++void InitKvStore() {
++	memset(kv_index, 0, sizeof(KV_INDEX_ENTRY) * MAX_KV_ENTRIES);
++	kv_current_lsa = 0;
++	xil_printf("[prj3] KV store initialized\r\n");
++}
+--- a/firmware/ftl_config.c
++++ b/firmware/ftl_config.c
+@@ -52,6 +52,7 @@
+ #include "memory_map.h"
+ #include "t4nsc_ucode.h"
+ #include "nsc_driver.h"
++#include "kv_store.h"	// [prj3] KV index
+ 
+ unsigned int storageCapacity_L;
+ T4REGS chCtlReg[USER_CHANNELS];
+@@ -68,6 +69,7 @@
+ 	InitAddressMap();
+ 	InitDataBuf();
+ 	InitGcVictimMap();
++	InitKvStore();	// [prj3] Clear the KV index at boot, right after FTL setup
+ 
+ 	storageCapacity_L = (MB_PER_SSD - (MB_PER_MIN_FREE_BLOCK_SPACE + mbPerbadBlockSpace + MB_PER_OVER_PROVISION_BLOCK_SPACE)) * ((1024*1024) / BYTES_PER_NVME_BLOCK);
+ 
+--- a/firmware/request_allocation.c
++++ b/firmware/request_allocation.c
+@@ -46,6 +46,8 @@
+ #include "xil_printf.h"
+ #include <assert.h>
+ #include "memory_map.h"
++#include "nvme/host_lld.h"	// [prj3] set_auto_nvme_cpl, NVME_CMD_SRAM_ADDR
++#include "nvme/nvme.h"		// [prj3] IO_NVM_KV_GET
+ 
+ P_REQ_POOL reqPoolPtr;
+ FREE_REQUEST_QUEUE freeReqQ;
+@@ -372,6 +374,22 @@
+ 	reqPoolPtr->reqPool[reqSlotTag].reqQueueType = REQ_QUEUE_TYPE_NONE;
+ 	nvmeDmaReqQ.reqCnt--;
+ 
++	// [prj3] Send the completion ourselves, only for KV-GET.
++	//        The host kv_bench reads the result field of a GET completion as the value length,
++	//        but hardware auto completion always sets result to 0.
++	//        So request_transform.c turns off auto completion for KV-GET,
++	//        and here, after the read DMA (TxDMA) is done, we complete it with result = 4096.
++	//        The original opcode still in the command SRAM tells us which command it is.
++	if(reqPoolPtr->reqPool[reqSlotTag].reqCode == REQ_CODE_TxDMA) {
++		unsigned int cmdSlotTag = reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag;
++		unsigned int *cmdDword = (unsigned int*)(NVME_CMD_SRAM_ADDR + (cmdSlotTag * 64));
++		unsigned int opcode = cmdDword[0] & 0xFF;
++
++		if(opcode == IO_NVM_KV_GET) {
++			set_auto_nvme_cpl(cmdSlotTag, 4096, 0);
++		}
++	}
++
+ 	PutToFreeReqQ(reqSlotTag);
+ 	ReleaseBlockedByBufDepReq(reqSlotTag);
+ }
+--- a/firmware/request_transform.c
++++ b/firmware/request_transform.c
+@@ -595,9 +595,16 @@
+ 	}
+ 	else if(reqPoolPtr->reqPool[reqSlotTag].reqCode == REQ_CODE_TxDMA)
+ 	{
++		// [prj3] For KV-GET, turn off auto completion of the read DMA (normal READ stays ON).
++		//        request_allocation.c sends the completion after the DMA, with the value length.
++		unsigned int cmdSlotTag = reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag;
++		unsigned int *cmdDword = (unsigned int*)(NVME_CMD_SRAM_ADDR + (cmdSlotTag * 64));
++		unsigned int opcode = cmdDword[0] & 0xFF;
++		unsigned int autoCompletion = (opcode == IO_NVM_KV_GET) ? NVME_COMMAND_AUTO_COMPLETION_OFF : NVME_COMMAND_AUTO_COMPLETION_ON;
++
+ 		while(numOfNvmeBlock < reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.numOfNvmeBlock)
+ 		{
+-			set_auto_tx_dma(reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag, dmaIndex, devAddr, NVME_COMMAND_AUTO_COMPLETION_ON);
++			set_auto_tx_dma(cmdSlotTag, dmaIndex, devAddr, autoCompletion);	// [prj3] use the value chosen above instead of always ON
+ 
+ 			numOfNvmeBlock++;
+ 			dmaIndex++;
+--- a/firmware/nvme/nvme.h
++++ b/firmware/nvme/nvme.h
+@@ -83,9 +83,13 @@
+ #define IO_NVM_FLUSH										0x00
+ #define IO_NVM_WRITE										0x01
+ #define IO_NVM_READ											0x02
++#define IO_NVM_HELLO										0x03	// [prj1] Use an opcode that the standard command set does not use
+ #define IO_NVM_WRITE_UNCORRECTABLE							0x04
+ #define IO_NVM_COMPARE										0x05
+ #define IO_NVM_DATASET_MANAGEMENT							0x09
++// [prj3] KV command opcodes. Must match what the host kv_bench sends (0x80 and up is vendor-specific)
++#define IO_NVM_KV_PUT										0xA0
++#define IO_NVM_KV_GET										0xA1
+ 
+ /*Status Code Type */
+ #define SCT_GENERIC_COMMAND_STATUS							0
+@@ -120,6 +124,7 @@
+ #define SC_HOST_IDENTIFIER_INCONSISTENT_FORMAT				0x18
+ #define SC_KEEP_ALIVE_TIMEOUT_EXPIRED						0x19
+ #define SC_KEEP_ALIVE_TIMEOUT_INVALID						0x1A
++#define SC_NO_SUCH_KEY										0x7C1	// [prj3] Status code for an unknown key (kv_bench counts it as NO-SUCH-KEY)
+ 
+ /*Status Code - Generic Command Status Values, NVM Command Set */
+ #define SC_LBA_OUT_OF_RANGE									0x80
+--- a/firmware/nvme/nvme_io_cmd.c
++++ b/firmware/nvme/nvme_io_cmd.c
+@@ -60,6 +60,7 @@
+ 
+ #include "../ftl_config.h"
+ #include "../request_transform.h"
++#include "../kv_store.h"	// [prj3] KV index
+ 
+ void handle_nvme_io_read(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
+ {
+@@ -69,7 +70,7 @@
+ 	unsigned int startLba[2];
+ 	unsigned int nlb;
+ 	unsigned int nsid = nvmeIOCmd->NSID;
+-	
++
+ 
+ 	readInfo12.dword = nvmeIOCmd->dword[12];
+ 	//readInfo13.dword = nvmeIOCmd->dword[13];
+@@ -116,6 +117,53 @@
+ 	ReqTransNvmeToSlice(cmdSlotTag, startLba[0] + (storageCapacity_L / USER_CHANNELS) * (nsid - 1), nlb, IO_NVM_WRITE);
+ }
+ 
++// [prj3] KV-PUT: key in dword[10], value block count (NLB, 0-based) in dword[12], length in dword[13].
++//        The key difference from block I/O: dword[10] holds the key instead of the start LBA.
++void handle_nvme_kv_put(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd) {
++	uint32_t key = nvmeIOCmd->dword[10];
++	uint32_t nlb = nvmeIOCmd->dword[12];
++	uint32_t value_len = nvmeIOCmd->dword[13];
++
++	ASSERT(key < MAX_KV_ENTRIES);
++
++	// [prj3] Write the value at the end of the append-only log (kv_current_lsa) and save that place in the index
++	uint32_t lsa = kv_current_lsa;
++
++	kv_index[key].lsa = lsa;
++	kv_index[key].value_len = value_len;
++	kv_index[key].valid = 1;
++
++	// [prj3] Store it through the normal block write path.
++	//        The FTL does not know it is a KV command; it sees a normal LSA write.
++	ReqTransNvmeToSlice(cmdSlotTag, lsa, nlb, IO_NVM_WRITE);
++
++	kv_current_lsa += (nlb + 1);
++}
++
++// [prj3] KV-GET: find the key's place in the index and read it through the normal block read path
++void handle_nvme_kv_get(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd) {
++	uint32_t key = nvmeIOCmd->dword[10];
++	NVME_COMPLETION nvmeCPL;
++
++	// [prj3] Unknown key: complete right away with "No such key", with no data transfer.
++	//        Bit 0 of statusFieldWord is the Phase Tag, so shift the status code left by 1.
++	if (key >= MAX_KV_ENTRIES || !kv_index[key].valid) {
++		nvmeCPL.dword[0] = 0;
++		nvmeCPL.statusFieldWord = (SC_NO_SUCH_KEY << 1);
++		nvmeCPL.specific = 0;
++		set_auto_nvme_cpl(cmdSlotTag, nvmeCPL.specific, nvmeCPL.statusFieldWord);
++		return;
++	}
++
++	// [prj3] Values are fixed at 4KB -> NLB 0 (one block)
++	uint32_t lsa = kv_index[key].lsa;
++	uint32_t nlb = (4096 - 1) / BYTES_PER_NVME_BLOCK;
++
++	// [prj3] Do not send the completion here.
++	//        request_allocation.c sends it after the DMA, with the value length.
++	ReqTransNvmeToSlice(cmdSlotTag, lsa, nlb, IO_NVM_READ);
++}
++
+ void handle_nvme_io_cmd(NVME_COMMAND *nvmeCmd)
+ {
+ 	NVME_IO_COMMAND *nvmeIOCmd;
+@@ -154,6 +202,29 @@
+ 			handle_nvme_io_read(nvmeCmd->cmdSlotTag, nvmeIOCmd);
+ 			break;
+ 		}
++		// [prj1] New HELLO command (0x03): print a self-introduction over UART (added in prj1)
++		case IO_NVM_HELLO:
++		{
++			xil_printf("Name: HyungsunYoo\r\n");
++			xil_printf("Affiliation: Sogang University Computer Science and Engineering\r\n");
++			xil_printf("Interests: Embedded Systems and Operating Systems\r\n");
++
++			nvmeCPL.dword[0] = 0;
++			nvmeCPL.specific = 0x0;
++			set_auto_nvme_cpl(nvmeCmd->cmdSlotTag, nvmeCPL.specific, nvmeCPL.statusFieldWord);
++			break;
++		}
++		// [prj3] KV command cases
++		case IO_NVM_KV_PUT:
++		{
++			handle_nvme_kv_put(nvmeCmd->cmdSlotTag, nvmeIOCmd);
++			break;
++		}
++		case IO_NVM_KV_GET:
++		{
++			handle_nvme_kv_get(nvmeCmd->cmdSlotTag, nvmeIOCmd);
++			break;
++		}
+ 		default:
+ 		{
+ 			xil_printf("Not Support IO Command OPC: %X\r\n", opc);

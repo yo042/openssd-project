@@ -1,0 +1,110 @@
+--- a/firmware/address_translation.c
++++ b/firmware/address_translation.c
+@@ -624,16 +624,33 @@
+ 	InitCurrentBlockOfDieMap();
+ }
+ 
++// [prj2] Block-level FTL Read
++//        The mapping table stores only LBN -> physical block (the VSA of its page 0).
++//        The page inside the block is not stored; it is computed from the LSA offset.
+ unsigned int AddrTransRead(unsigned int logicalSliceAddr)
+ {
+ 	unsigned int virtualSliceAddr;
+ 
+ 	if(logicalSliceAddr < SLICES_PER_SSD)
+ 	{
+-		virtualSliceAddr = logicalSliceMapPtr->logicalSlice[logicalSliceAddr].virtualSliceAddr;
++		// [prj2] Split the LSA into LBN (block number) and offset in the block (1 block = 256 slices)
++		unsigned int lbn = logicalSliceAddr / SLICES_PER_BLOCK;
++		unsigned int offset = logicalSliceAddr % SLICES_PER_BLOCK;
++
++		// [prj2] Look up the table by LBN, not LSA -> 1/256 as many entries as page-level
++		virtualSliceAddr = logicalSliceMapPtr->logicalSlice[lbn].virtualSliceAddr;
+ 
+ 		if(virtualSliceAddr != VSA_NONE)
+-			return virtualSliceAddr;
++		{
++			// [prj2] Take die/block from the stored VSA and put the offset in the page field.
++			//        Sequential writes are stored in offset order, so this matches.
++			//        Random writes are stored in a different order, so it mismatches (a block-level limit).
++			unsigned int dieNo = Vsa2VdieTranslation(virtualSliceAddr);
++			unsigned int blockNo = Vsa2VblockTranslation(virtualSliceAddr);
++
++			unsigned int targetVsa = Vorg2VsaTranslation(dieNo, blockNo, offset);
++			return targetVsa;
++		}
+ 		else
+ 			return VSA_FAIL;
+ 	}
+@@ -641,20 +658,66 @@
+ 		assert(!"[WARNING] Logical address is larger than maximum logical address served by SSD [WARNING]");
+ }
+ 
++// [prj2] Block-level FTL Write
++//        Writes to the same LBN always go to the same physical block.
+ unsigned int AddrTransWrite(unsigned int logicalSliceAddr)
+ {
+ 	unsigned int virtualSliceAddr;
+ 
+ 	if(logicalSliceAddr < SLICES_PER_SSD)
+ 	{
+-		InvalidateOldVsa(logicalSliceAddr);
++		// [prj2] The original InvalidateOldVsa assumes per-LSA mapping, which does not fit block mapping.
++		//        Turned off for simplicity; GC is not implemented.
++		//InvalidateOldVsa(logicalSliceAddr);
++
++		// [prj2] Convert LSA to LBN (block number)
++		unsigned int lbn = logicalSliceAddr / SLICES_PER_BLOCK;
++
++		// [prj2] Check if this LBN already has a physical block
++		unsigned int mapped_vsa = logicalSliceMapPtr->logicalSlice[lbn].virtualSliceAddr;
++
++		if(mapped_vsa == VSA_NONE)
++		{
++			// [prj2] First write to this LBN: take a free block and start at page 0
++			unsigned int dieNo = sliceAllocationTargetDie;
++			unsigned int newBlock = GetFromFbList(dieNo, GET_FREE_BLOCK_NORMAL);
++
++			// [prj2] Record the block's page 0 VSA as "the physical block of this LBN"
++			virtualSliceAddr = Vorg2VsaTranslation(dieNo, newBlock, 0);
++			virtualBlockMapPtr->block[dieNo][newBlock].currentPage = 1;
++
++			logicalSliceMapPtr->logicalSlice[lbn].virtualSliceAddr = virtualSliceAddr;
++			virtualSliceMapPtr->virtualSlice[virtualSliceAddr].logicalSliceAddr = lbn;
+ 
+-		virtualSliceAddr = FindFreeVirtualSlice();
++			// [prj2] Give the next LBN a different die to keep channel/way parallelism
++			sliceAllocationTargetDie = FindDieForFreeSliceAllocation();
+ 
+-		logicalSliceMapPtr->logicalSlice[logicalSliceAddr].virtualSliceAddr = virtualSliceAddr;
+-		virtualSliceMapPtr->virtualSlice[virtualSliceAddr].logicalSliceAddr = logicalSliceAddr;
++			return virtualSliceAddr;
++		}
++		else
++		{
++			// [prj2] Keep writing to the block already assigned
++			unsigned int dieNo = Vsa2VdieTranslation(mapped_vsa);
++			unsigned int blockNo = Vsa2VblockTranslation(mapped_vsa);
++
++			// [prj2] When all 256 pages are used, switch to a new block (no GC, so the old one stays)
++			if(virtualBlockMapPtr->block[dieNo][blockNo].currentPage >= USER_PAGES_PER_BLOCK)
++			{
++				virtualSliceAddr = FindFreeVirtualSlice();
++
++				logicalSliceMapPtr->logicalSlice[lbn].virtualSliceAddr = virtualSliceAddr;
++				virtualSliceMapPtr->virtualSlice[virtualSliceAddr].logicalSliceAddr = lbn;
++
++				return virtualSliceAddr;
++			}
++
++			// [prj2] NAND can only program pages in order, starting from page 0.
++			//        So ignore the host's offset and append at currentPage (the next free page).
++			unsigned int targetVsa = Vorg2VsaTranslation(dieNo, blockNo, virtualBlockMapPtr->block[dieNo][blockNo].currentPage);
++			virtualBlockMapPtr->block[dieNo][blockNo].currentPage++;
+ 
+-		return virtualSliceAddr;
++			return targetVsa;
++		}
+ 	}
+ 	else
+ 		assert(!"[WARNING] Logical address is larger than maximum logical address served by SSD [WARNING]");

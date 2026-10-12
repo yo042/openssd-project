@@ -1,0 +1,70 @@
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -20,6 +20,8 @@
+ #include <linux/nvme_ioctl.h>
+ #include <linux/pm_qos.h>
+ #include <asm/unaligned.h>
++/* [prj4] strncasecmp */
++#include <linux/string.h>
+ 
+ #include "nvme.h"
+ #include "fabrics.h"
+@@ -80,6 +82,12 @@
+ module_param(streams, bool, 0644);
+ MODULE_PARM_DESC(streams, "turn on support for Streams write directives");
+ 
++/* [prj4] Detect Cosmos+ OpenSSD by the model name (mn) in Identify Controller */
++static bool nvme_is_cosmos_openssd(const struct nvme_id_ctrl *id)
++{
++	return !strncasecmp(id->mn, "COSMOS+", 7);
++}
++
+ /*
+  * nvme_wq - hosts nvme related works that are not reset or delete
+  * nvme_reset_wq - hosts nvme reset works
+@@ -2911,7 +2919,9 @@
+ 	struct nvme_id_ctrl_nvm *id;
+ 	int ret;
+ 
+-	if (ctrl->oncs & NVME_CTRL_ONCS_DSM) {
++	/* [prj4] Cosmos+ cannot handle discard (DSM), so keep the discard limit at 0 when the quirk is set */
++	if (ctrl->oncs & NVME_CTRL_ONCS_DSM &&
++	    !(ctrl->quirks & NVME_QUIRK_NO_DISCARD)) {
+ 		ctrl->max_discard_sectors = UINT_MAX;
+ 		ctrl->max_discard_segments = NVME_DSM_MAX_RANGES;
+ 	} else {
+@@ -2931,7 +2941,8 @@
+ 	else
+ 		ctrl->max_zeroes_sectors = 0;
+ 
+-	if (nvme_ctrl_limited_cns(ctrl))
++	/* [prj4] Stop here so the extra Identify query below (dmrsl) does not set the discard limit again */
++	if (nvme_ctrl_limited_cns(ctrl) || (ctrl->quirks & NVME_QUIRK_NO_DISCARD))
+ 		return 0;
+ 
+ 	id = kzalloc(sizeof(*id), GFP_KERNEL);
+@@ -2983,6 +2994,10 @@
+ 	if (!ctrl->identified) {
+ 		unsigned int i;
+ 
++		/* [prj4] Turn on the no-discard quirk when the device is Cosmos+ */
++		if (nvme_is_cosmos_openssd(id))
++			ctrl->quirks |= NVME_QUIRK_NO_DISCARD;
++
+ 		/*
+ 		 * Check for quirks.  Quirk can depend on firmware version,
+ 		 * so, in principle, the set of quirks present can change
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -164,6 +164,11 @@
+ 	 * Disables simple suspend/resume path.
+ 	 */
+ 	NVME_QUIRK_FORCE_NO_SIMPLE_SUSPEND	= (1 << 20),
++	/* [prj4] New quirk: the device does not support discard (deallocate) */
++	/*
++	 * Discard (deallocate) is not supported.
++	 */
++	NVME_QUIRK_NO_DISCARD			= (1 << 21),
+ };
+ 
+ /*
